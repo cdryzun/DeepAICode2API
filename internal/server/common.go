@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,7 +77,11 @@ func (u Usage) anthropicUsage(outputTokens int) map[string]any {
 // affinityPattern 与桌面端一致：只透传安全字符集的会话标识。
 var affinityPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,256}$`)
 
-// affinityFor 解析会话粘性标识（响应头优先，其次 prompt_cache_key）。
+// affinityFor 解析会话粘性标识。
+//
+// 优先级：显式头 > prompt_cache_key > 上下文指纹。前两个由调用方声明，
+// 第三个是兜底：多数客户端（magpie、各种 SDK 封装）两个都不送，若就此放弃
+// 亲和，多号池就会把同一条对话的前缀缓存摊薄到 N 个号上。
 func affinityFor(r *http.Request, payload map[string]any) string {
 	if r != nil {
 		if v := strings.TrimSpace(r.Header.Get("X-Session-Affinity")); affinityPattern.MatchString(v) {
@@ -88,7 +93,75 @@ func affinityFor(r *http.Request, payload map[string]any) string {
 			return strings.TrimSpace(v)
 		}
 	}
-	return ""
+	return conversationFingerprint(payload)
+}
+
+// conversationFingerprint 用请求的「前导内容」算一个稳定的会话指纹。
+//
+// 取 system/developer 指令 + 第一条对话消息：同一条对话逐轮追加的后文不影响它，
+// 不同对话几乎不会撞。只用 sha256 前 12 位十六进制（48 bit），既短又够用。
+func conversationFingerprint(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	var b strings.Builder
+
+	// system / instructions / developer
+	b.WriteString(strOf(payload["instructions"]))
+	switch sys := payload["system"].(type) {
+	case string:
+		b.WriteString(sys)
+	case []any:
+		for _, block := range sys {
+			if m, ok := block.(map[string]any); ok {
+				b.WriteString(strOf(m["text"]))
+			}
+		}
+	}
+
+	first := ""
+	appendMsg := func(v any) {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return
+		}
+		role := strings.ToLower(strOf(m["role"]))
+		if role == "system" || role == "developer" {
+			b.WriteString(strOf(m["content"]))
+			return
+		}
+		if first == "" {
+			if raw, err := json.Marshal(m); err == nil {
+				first = string(raw)
+			}
+		}
+	}
+	switch msgs := payload["messages"].(type) {
+	case []any:
+		for _, m := range msgs {
+			if first != "" {
+				break
+			}
+			appendMsg(m)
+		}
+	case nil:
+		// Responses 形状：input 可能是字符串或条目数组。
+		switch in := payload["input"].(type) {
+		case string:
+			first = in
+		case []any:
+			for _, m := range in {
+				if first != "" {
+					break
+				}
+				appendMsg(m)
+			}
+		}
+	}
+	b.WriteString(first)
+
+	sum := fmt.Sprintf("%x", sha256.Sum256([]byte(b.String())))
+	return "conv-" + sum[:12]
 }
 
 // catalog 返回当前模型目录；目录为空时回落到内置兜底模型，

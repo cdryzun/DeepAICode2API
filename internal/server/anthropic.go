@@ -77,7 +77,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	affinity := affinityFor(r, nil)
+	affinity := affinityFor(r, payload)
 	key := extractKey(r)
 	promptLen := estimatePromptLen(payload)
 

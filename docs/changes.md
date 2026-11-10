@@ -1143,13 +1143,28 @@ TestChatBodyFallbackKeepsSamplingFields   store:false 原值保留
   input 不含缓存，直接填上游 prompt_tokens 会让客户端把上下文数两遍）；
 - `LogEntry.TokensCached` / `Stats.TotalTokensCached` 落库，`/admin/api/logs`
   与统计页可直接算命中率；
-- `Server.pins`：`prompt_cache_key` / `X-Session-Affinity` → 账号 的亲和表
-  （TTL 30min、上限 4096）。命中亲和且号可调度时直接复用，不再推进轮询游标；
-  号满或失败时退回常规调度——亲和是最优化，不阻塞也不在坏号上反复踩。
+- `Server.pins`：会话标识 → 账号 的亲和表（TTL 30min、上限 4096）。命中且号可
+  调度时直接复用，不再推进轮询游标；号满或失败时退回常规调度——亲和是最优化，
+  不阻塞也不在坏号上反复踩；
+- 会话标识的来源：`X-Session-Affinity` > `prompt_cache_key` > **上下文指纹**
+  （sha256(system/instructions 文本 + 第一条非 system 消息)，取前 12 位十六进制）。
+  第三条是给 magpie / 各类 SDK 封装准备的：它们两个头都不送，而没有兜底就等于
+  让多号池自动把同一条对话的缓存打散。
 
 **验证**：`cache_usage_test.go`（三种上游形状解析、Anthropic 口径扣减、
-两种出口的字段、日志/统计落库、亲和钉号 vs 无亲和轮询）。生产实测：
-同一会话 5/6 落回同一账号；真实 33–38k 上下文流量的日志命中率 94.9–97.6%。
+两种出口的字段、日志/统计落库、亲和钉号 vs 不同对话轮询、指纹跨轮稳定）。
+生产实测（两号池）：同一对话连发 8 次全部落回同一账号、不同对话 4/4 均分；
+逐轮增长的对话，从第三次起命中率稳定在 91–95%：
+
+```
+turn1 prompt=833  cached=0    provider=Particle AI   ← 首轮冷启动
+turn2 prompt=886  cached=0    provider=Wafer
+turn3 prompt=912  cached=832  hit=91.2%  provider=Wafer
+turn4 prompt=941  cached=896  hit=95.2%  provider=Wafer
+turn6 prompt=1009 cached=960  hit=95.1%  provider=Wafer
+```
+
+真实 33–38k 上下文的生产流量的日志命中率 94.9–97.6%。
 
 **边界**：上游对 `provider` 字段（OpenRouter 风格 `order`/`only`/字符串）一律
 忽略，单请求内无法指定推理后端；实测 6 次请求落在 Modal / Wafer / CoreWeave /

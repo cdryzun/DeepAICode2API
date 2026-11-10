@@ -195,11 +195,11 @@ func TestAffinityPinsAccount(t *testing.T) {
 	s := New(st)
 	s.Up.Origin = u.srv.URL
 
-	// asked 发一次请求，返回它落到的账号 ID。
-	asked := func(affinity string) string {
+	// asked 发一次请求，返回它落到的账号 ID；user 决定上下文指纹。
+	asked := func(affinity, user string) string {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-			strings.NewReader(`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}`))
+		body := `{"model":"glm-5.3-flash","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"` + user + `"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 		req.RemoteAddr = "127.0.0.1:34567"
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+key)
@@ -219,26 +219,71 @@ func TestAffinityPinsAccount(t *testing.T) {
 	}
 
 	// 同一亲和键：第一条锁定账号，后两条必须复用（不跟随轮询迁移）。
-	a1 := asked("conv-1")
-	a2 := asked("conv-1")
-	a3 := asked("conv-1")
+	a1 := asked("conv-1", "hi")
+	a2 := asked("conv-1", "hi")
+	a3 := asked("conv-1", "hi")
 	if a1 != a2 || a2 != a3 {
 		t.Fatalf("同一会话落到了不同账号：%s → %s → %s", a1, a2, a3)
 	}
 
 	// 另一个会话在两条请求内也保持自洽（不必与 conv-1 同号）。
-	b1 := asked("conv-2")
-	b2 := asked("conv-2")
+	b1 := asked("conv-2", "hello")
+	b2 := asked("conv-2", "hello")
 	if b1 != b2 {
 		t.Fatalf("第二个会话也在漂移：%s → %s", b1, b2)
 	}
 
-	// 不带亲和键时依旧轮询：4 条请求至少能碰到两个不同的号（容量优先）。
+	// 什么亲和标识都不给的客户端：靠上下文指纹钉住同一个号。
+	// 这是 magpie / 多数 SDK 的真实形态，不兼容它的话多号池就等于自动打散缓存。
+	f1 := asked("", "fingerprinted")
+	f2 := asked("", "fingerprinted")
+	if f1 != f2 {
+		t.Fatalf("相同上下文没有落在同一个账号：%s → %s", f1, f2)
+	}
+
+	// 不同对话（首条消息不同）依然轮询：容量优先。
 	seen := map[string]bool{}
-	for i := 0; i < 4; i++ {
-		seen[asked("")] = true
+	for i := 0; i < 6; i++ {
+		seen[asked("", "conv-"+string(rune('a'+i)))] = true
 	}
 	if len(seen) < 2 {
-		t.Fatalf("无亲和键时应该轮询多个账号，实际只用到 %v", seen)
+		t.Fatalf("不同对话应该分到多个账号，实际只用到 %v", seen)
+	}
+}
+
+// TestConversationFingerprint 校验上下文指纹：同对话稳定、跨对话不撞、
+// 且逐轮追加的消息不改变它。
+func TestConversationFingerprint(t *testing.T) {
+	user := func(s string) map[string]any {
+		return map[string]any{"role": "user", "content": s}
+	}
+	sys := map[string]any{"role": "system", "content": "be brief"}
+
+	// 同一对话末轮（只追加了后文）：指纹不变。
+	turn1 := map[string]any{"messages": []any{sys, user("q1")}}
+	turn3 := map[string]any{"messages": []any{
+		sys, user("q1"),
+		map[string]any{"role": "assistant", "content": "a1"},
+		user("q2"),
+	}}
+	if conversationFingerprint(turn1) != conversationFingerprint(turn3) {
+		t.Fatal("同一对话逐轮追加后指纹变了")
+	}
+
+	// 不同对话：首条用户消息不同 → 指纹不同。
+	other := map[string]any{"messages": []any{sys, user("q2")}}
+	if conversationFingerprint(turn1) == conversationFingerprint(other) {
+		t.Fatal("不同对话撞了同一个指纹")
+	}
+
+	// Responses 形状（instructions + 字符串 input）也能算出指纹。
+	fp := conversationFingerprint(map[string]any{"instructions": "be brief", "input": "q1"})
+	if fp == "" || len(fp) != len("conv-")+12 {
+		t.Fatalf("指纹格式不对：%q", fp)
+	}
+
+	// 空请求体不产生指纹（据此退回纯轮询）。
+	if got := conversationFingerprint(nil); got != "" {
+		t.Fatalf("nil payload 指纹应为空，得到 %q", got)
 	}
 }
