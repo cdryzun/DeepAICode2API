@@ -294,6 +294,7 @@ print(client.chat.completions.create(
 | `-allow-insecure` | `DEEPAI2API_ALLOW_INSECURE` | `false` | 允许非回环监听但不设管理密码 |
 | `-max-inflight` | `DEEPAI2API_MAX_INFLIGHT` | `2` | 单号同时在途的上游请求上限（总槽位 = 账号数 × 该值） |
 | `-admission-wait` | `DEEPAI2API_ADMISSION_WAIT` | `2s` | 槽位全满时的排队上限，超时才回 429（`0` 立即拒绝） |
+| — | `DEEPAI2API_EGRESS_POOL` | 直连 + `PROXY_POOL` | 出口优先顺序（`direct,…`）；额度耗尽时按这个顺序自动漂移 |
 | `-import` | — | — | 仅导入凭据后退出 |
 | `-no-import` | — | — | 启动时不自动导入 |
 | `-seal` | — | — | 把状态/统计/日志中的存量明文封存为密文后退出（需 `DEEPAI2API_MASTER_KEY`） |

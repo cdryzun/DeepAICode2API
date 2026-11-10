@@ -36,6 +36,8 @@ func accountView(a *deepai.Account) map[string]any {
 		"plan": a.Plan, "email_verified": a.EmailVerified,
 		"user_pk": a.UserPK, "group": a.GroupName(),
 		"proxy": deepai.MaskProxy(a.Proxy), "fingerprint": a.Fingerprint,
+		// 出口冷却表：哪条出口对这个号的当日额度已用光、什么时候回切。
+		"egress_cooldown": a.EgressCooldown,
 		// 机器指纹只下发摘要：上游按它发额度，完整值没必要出网。
 		"machine": maskMachine(a.MachineID), "has_machine": a.MachineID != "",
 		"registered_at": a.RegisteredAt, "last_verified": a.LastVerified,

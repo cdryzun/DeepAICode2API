@@ -325,6 +325,10 @@ func dispatchable(a *deepai.Account, group string) bool {
 	if a == nil || !a.Enabled || a.Status == deepai.StatusBlocked {
 		return false
 	}
+	// 当日额度在所有出口上都用光：刷新前不要再打它（后台 RestoreEgress 会解除）。
+	if a.Status == deepai.StatusExhausted {
+		return false
+	}
 	return group == "" || strings.EqualFold(a.GroupName(), group)
 }
 
@@ -592,6 +596,24 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 				continue
 			}
 			return nil, acct, httpErr
+		}
+
+		// 当日额度耗尽：按 **(账号 × 出口)** 计，换号没用、换出口才有用。
+		// 把当前出口冷却到额度刷新时间，立刻在下一出口上重试；
+		// 所有出口都凉了就冷静到刷新时间，交给别的号——不能当普通失败重试，
+		// 那只会把好号打成 error 还把失败计数刷成几十上百。
+		if httpErr.DailyQuotaExceeded() {
+			if s.rotateEgressOnExhausted(acct, blockedReason(httpErr)) {
+				lastErr = httpErr
+				continue
+			}
+			s.Store.UpdateAccount(acct.ID, func(a *deepai.Account) {
+				a.Status = deepai.StatusExhausted
+				a.LastErr = blockedReason(httpErr)
+			})
+			_ = s.Store.Save()
+			lastErr = httpErr
+			continue
 		}
 
 		// 容量拒绝：池里还有空槽就立刻换号（粘性由 X-Session-Affinity 保证，

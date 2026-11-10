@@ -1202,3 +1202,41 @@ InferenceNet 四家。命中率因此仍受上游路由随机性影响，网关�
 
 **遗留**：日志里 `statusOf(err)` 把所有网关侧错误记成 502，但客户端收到的是
 `errAllAccountsBusy` 的 429。统计口径要靠 `err` 文本区分，本轮没动。
+
+---
+
+## 30. 出口自动漂移：额度按「账号 × 出口」计，用光了就换出口
+
+**现象**：号池两个账号双双报
+`429 {"code":"rate_limit_exceeded","message":"Too many requests today. Try again tomorrow."}`，
+但同一时刻、同一请求从别的出口（办公 mihomo、uk-01）发出去都是 200；而且同一个
+腾讯 IP 上另一个账号仍然可用。改用办公出口后服务恢复，代价是首字节从 0.55s 涨到
+1.8~2.5s（办公家宽的国际路由比云主机差）。
+
+**结论**：上游的每日额度是按 **(账号 × 出口 IP)** 记的账 —— 换账号有用、换出口也有用，
+只有「在同一个出口上重试」没用。而出口之间的延迟差 3~4 倍，所以固定挂一条慢出口
+不是办法。
+
+**改动**（`internal/server/egress.go` 新增，~230 行 + 4 个测试）：
+
+- `Account.EgressCooldown map[label]unix`：记录「这条出口对这个号的当日额度已耗尽」；
+- `HTTPError.DailyQuotaExceeded()`：只认 `rate_limit_exceeded` + `Too many requests today`，
+  与瞬时 429 严格区分；
+- `EgressCandidates()`：出口优先顺序 = `DEEPAI2API_EGRESS_POOL`，缺省为「直连 → `PROXY_POOL`」
+  的顺序（直连最快，所以排第一）；
+- `openModel` 命中该错误时：把当前出口冷却到 `theos.refresh_at`（拿不到则 6h），
+  切到下一条未冷却出口并**立刻重试**；全部出口都凉 → 账号标 `exhausted` 交给别的号。
+  这类失败**不计入 `Failures`**（它不是账号故障），避免被「失败最少优先」饿死；
+- `pool.Scheduler` 跳过 `exhausted`；后台守护（`QuotaGuardInterval=5min`）先
+  `RestoreEgress()` 再复探额度：冷却到期 → 清冷却表、切回首选出口（直连）。
+
+**验证**：
+
+- 单测：漂移后在新出口上成功（真实 CONNECT 代理）、全耗尽时标记 `exhausted`
+  且不改出口、冷却到期回切并清表、健康请求不漂移、出口清单解析顺序；
+- 生产：两个号都把出口清回直连（此时直连已耗尽）→ 首次请求各自自动漂到
+  可用出口并返回 200，日志 `[egress] xxx 出口额度耗尽：direct → http://…`，
+  之后 10/10 请求全 200，失败计数保持 0。
+
+**边界**：这条策略只解决「额度到期后的可用性」，不解决延迟 —— 慢出口仍然是慢的。
+要低延迟得让**首选出口本身**有额度（加号 / 换更近的出口），漂移只是兜底。

@@ -276,6 +276,11 @@ func quotaGuard(srv *server.Server, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-tick.C:
+			// 出口回切要先做：额度刷新后把账号切回最快的直连，
+			// 之后的复探才会走新出口（否则快照还是旧出口的）。
+			if n := srv.RestoreEgress(); n > 0 {
+				log.Printf("[egress] 后台已回切 %d 个账号的出口", n)
+			}
 			if n := srv.ReprobeStale(server.QuotaGuardBatch); n > 0 {
 				log.Printf("[quota] 后台已复探 %d 个账号的额度", n)
 			}

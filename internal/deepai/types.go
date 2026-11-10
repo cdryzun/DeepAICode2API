@@ -75,6 +75,9 @@ const (
 	// 与普通错误不同：它不是网络/额度问题，换号重试也救不回来，
 	// 调度器应直接跳过，直到一次成功的 /theos 把它重新置回 ok。
 	StatusBlocked = "blocked"
+	// StatusExhausted 表示该账号在所有已知出口上的当日额度都用光了。
+	// 它会在额度刷新（theos.refresh_at）后自动解除。
+	StatusExhausted = "exhausted"
 
 	// 路径前缀。
 	ModelBasePath = "/deepai_code"
@@ -232,8 +235,15 @@ type Account struct {
 	Group string `json:"group,omitempty"`
 
 	// Proxy 是该账号推理时使用的上游代理（完整 URL，仅本地保存）。
+	//
+	// 空串表示直连。上游按 **(账号 × 出口 IP)** 计每日额度，所以这个字段
+	// 会在「当前出口当日额度耗尽」时被自动漂移（见 server/egress.go）。
 	Proxy       string `json:"proxy,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
+
+	// EgressCooldown 记录每个出口对该账号的「当日额度耗尽」到期时间
+	// （出口可读名 → unix 秒）。键是 direct 或代理 URL。
+	EgressCooldown map[string]int64 `json:"egress_cooldown,omitempty"`
 
 	// 浏览器指纹快照（注册时写入）。推理侧带上同一套头，否则“用 Chrome 注册、
 	// 用空 UA 推理”本身就是一个可被识别的异常信号。
@@ -281,6 +291,13 @@ func (a *Account) Clone() *Account {
 	if a.Theos != nil {
 		theos := *a.Theos
 		cp.Theos = &theos
+	}
+	if a.EgressCooldown != nil {
+		cd := make(map[string]int64, len(a.EgressCooldown))
+		for k, v := range a.EgressCooldown {
+			cd[k] = v
+		}
+		cp.EgressCooldown = cd
 	}
 	return &cp
 }

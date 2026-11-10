@@ -122,6 +122,19 @@ func (e *HTTPError) BodyRejected() bool {
 	return strings.Contains(strings.ToLower(string(e.Body)), CodeNotDeepAICodeMsg)
 }
 
+// DailyQuotaExceeded 报告这类 429 是不是「这个账号在这条出口上的当日额度用完了」。
+//
+// 上游对同一账号的每个出口 IP 各有一份按天额度，耗尽后固定回
+// `{"type":"rate_limit_exceeded","message":"Too many requests today. Try again tomorrow."}`。
+// 它与普通的瞬时 429 语义完全不同：换账号/重试都没用，**换出口**才有用，
+// 而且今天之内换回同一条出口也没用。
+func (e *HTTPError) DailyQuotaExceeded() bool {
+	if e.Code() != "rate_limit_exceeded" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(e.Error()), "too many requests today")
+}
+
 // CheckInRefused 报告签到是否被上游按「当天重启次数」限流。
 //
 // 它与账号不可用不同：推理照常 200，只是会落在替身模型分支

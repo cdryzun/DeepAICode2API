@@ -51,6 +51,11 @@ func (s *Scheduler) Pick(accounts []*deepai.Account, group string) *deepai.Accou
 		if a.Status == deepai.StatusBlocked {
 			return false
 		}
+		// 当日额度在所有出口上都用光：刷新前打它只会拿 429。
+		// 这不是终态——后台 RestoreEgress 会在 refresh_at 之后改回 unknown。
+		if a.Status == deepai.StatusExhausted {
+			return false
+		}
 		return group == "" || strings.EqualFold(a.GroupName(), group)
 	}
 	if a := s.pick(accounts, eligible, true); a != nil {
