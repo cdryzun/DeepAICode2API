@@ -244,3 +244,23 @@ func TestEgressCandidatesOrder(t *testing.T) {
 		t.Fatal("直连标签错误")
 	}
 }
+
+// TestMergeFromKeepsEgressCooldown 保证「重新导入账号」不会把出口冷却表清掉。
+//
+// 生产上 amoaloas 是 DEEPAI_API_KEY 导入的：每次启动都会新建一个空账号再
+// MergeFrom 旧账号，漏掉冷却表就等于每次重启都把「已用光的出口」当成可用。
+func TestMergeFromKeepsEgressCooldown(t *testing.T) {
+	ex := &deepai.Account{ID: "a1", APIKey: "k", EgressCooldown: map[string]int64{"direct": 123}}
+	fresh := &deepai.Account{APIKey: "k"}
+	fresh.MergeFrom(ex)
+	if fresh.EgressCooldown["direct"] != 123 {
+		t.Fatalf("冷却表丢失: %v", fresh.EgressCooldown)
+	}
+	// 同一出口两个到期时间取更晚的；新表里独有的项保留。
+	fresh.EgressCooldown["proxy-x"] = 456
+	ex.EgressCooldown["direct"] = 999
+	fresh.MergeFrom(ex)
+	if fresh.EgressCooldown["direct"] != 999 || fresh.EgressCooldown["proxy-x"] != 456 {
+		t.Fatalf("合并策略错误: %v", fresh.EgressCooldown)
+	}
+}

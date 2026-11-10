@@ -322,6 +322,19 @@ func (a *Account) MergeFrom(ex *Account) {
 	a.Theos = ex.Theos
 	a.ProbeAfter = ex.ProbeAfter
 	a.ProbeFailures = ex.ProbeFailures
+	// 出口冷却表也属于运行态：重新导入（DEEPAI_API_KEY / 桌面端凭据）时
+	// 新构造的账号没有它，丢掉会让「已用光的出口」被当成可用，下一条请求
+	// 立刻又撞一次当日额度耗尽。
+	if len(ex.EgressCooldown) > 0 {
+		if a.EgressCooldown == nil {
+			a.EgressCooldown = make(map[string]int64, len(ex.EgressCooldown))
+		}
+		for k, v := range ex.EgressCooldown {
+			if cur, ok := a.EgressCooldown[k]; !ok || v > cur {
+				a.EgressCooldown[k] = v
+			}
+		}
+	}
 
 	fill := []struct {
 		dst *string
