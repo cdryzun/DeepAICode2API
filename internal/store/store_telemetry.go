@@ -53,6 +53,7 @@ func (s *Store) Record(e LogEntry, outChars int) {
 	s.st.Stats.TotalCharsOut += int64(outChars)
 	s.st.Stats.TotalTokensIn += int64(e.TokensIn)
 	s.st.Stats.TotalTokensOut += int64(e.TokensOut)
+	s.st.Stats.TotalTokensCached += int64(e.TokensCached)
 	s.st.Stats.TotalCost += e.Cost
 	s.statsDirty = true
 	keep := s.st.Settings.LogKeep

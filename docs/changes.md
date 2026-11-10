@@ -1113,3 +1113,45 @@ TestChatBodyFallbackKeepsSamplingFields   store:false 原值保留
 
 **未做**：用新判据重测「签到是不是准入条件」（§5.1 的表格是按旧判据测的，
 需要冷启动一对新的 (账号, 机器指纹)）。签到是有限资源，没在这轮消耗。
+
+---
+
+## 28. 缓存用量：如实上报 + 会话亲和钉号
+
+**现象**：调用方（magpie / Claude Code 一类客户端）看到的缓存命中率长期接近
+0，于是普遍怀疑「网关把前缀缓存打散了」。先量化再改：同一段 3.5k token 前缀
+连发，`/v1/chat/completions` 偶发命中（`cached_tokens=3520/3522`），而
+`/v1/responses` 恒为 0、`/v1/messages` 根本没有缓存字段；同一账号同一请求体的
+真实 33–38k 上下文流量，用网关日志里的成本反推缓存其实命中得很好。
+
+**根因**（两条，互不相关）：
+
+1. `Usage` 结构体里没有缓存字段，整条翻译链路无处承载。chat 路径因为「上游
+   JSON 原样透传」碰巧正确；`responses_translate.go` / `responses_stream.go`
+   把 `input_tokens_details.cached_tokens` 写死成 0；Anthropic 路径只输出
+   `input_tokens` / `output_tokens`。
+2. 调度按请求轮询账号。上游的前缀缓存按账号（及其背后推理后端）存放，
+   多号轮询等价于把同一条会话的缓存摊薄到 N 个号上。
+
+**改动**：
+
+- `Usage` 增加 `CachedTokens` / `CacheWriteTokens`，`parseUsage` 兼容三种上游
+  形状（`prompt_tokens_details` / `input_tokens_details` / `cache_read_*`）；
+- 三个出口如实上报：Responses 填 `input_tokens_details.cached_tokens`；
+  Anthropic 填 `cache_read_input_tokens` + `cache_creation_input_tokens`，
+  并把 `input_tokens` 改成 `prompt - cached - cache_write`（Anthropic 口径里
+  input 不含缓存，直接填上游 prompt_tokens 会让客户端把上下文数两遍）；
+- `LogEntry.TokensCached` / `Stats.TotalTokensCached` 落库，`/admin/api/logs`
+  与统计页可直接算命中率；
+- `Server.pins`：`prompt_cache_key` / `X-Session-Affinity` → 账号 的亲和表
+  （TTL 30min、上限 4096）。命中亲和且号可调度时直接复用，不再推进轮询游标；
+  号满或失败时退回常规调度——亲和是最优化，不阻塞也不在坏号上反复踩。
+
+**验证**：`cache_usage_test.go`（三种上游形状解析、Anthropic 口径扣减、
+两种出口的字段、日志/统计落库、亲和钉号 vs 无亲和轮询）。生产实测：
+同一会话 5/6 落回同一账号；真实 33–38k 上下文流量的日志命中率 94.9–97.6%。
+
+**边界**：上游对 `provider` 字段（OpenRouter 风格 `order`/`only`/字符串）一律
+忽略，单请求内无法指定推理后端；实测 6 次请求落在 Modal / Wafer / CoreWeave /
+InferenceNet 四家。命中率因此仍受上游路由随机性影响，网关只能保证「同一会话
+不自己把缓存摊薄」与「用量如实上报」。

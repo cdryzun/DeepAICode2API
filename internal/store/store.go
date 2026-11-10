@@ -44,30 +44,37 @@ type Settings struct {
 
 // LogEntry 是一条请求日志（只记元信息，不落对话内容）。
 type LogEntry struct {
-	Time      int64   `json:"time"`
-	Key       string  `json:"key"`
-	Account   string  `json:"account"`
-	Model     string  `json:"model"`
-	Endpoint  string  `json:"endpoint"`
-	Stream    bool    `json:"stream"`
-	Status    int     `json:"status"`
-	LatencyMS int64   `json:"latency_ms"`
-	PromptLen int     `json:"prompt_len"`
-	OutputLen int     `json:"output_len"`
-	TokensIn  int     `json:"tokens_in"`
-	TokensOut int     `json:"tokens_out"`
-	Cost      float64 `json:"cost"`
-	Err       string  `json:"err,omitempty"`
+	Time      int64  `json:"time"`
+	Key       string `json:"key"`
+	Account   string `json:"account"`
+	Model     string `json:"model"`
+	Endpoint  string `json:"endpoint"`
+	Stream    bool   `json:"stream"`
+	Status    int    `json:"status"`
+	LatencyMS int64  `json:"latency_ms"`
+	PromptLen int    `json:"prompt_len"`
+	OutputLen int    `json:"output_len"`
+	TokensIn  int    `json:"tokens_in"`
+	TokensOut int    `json:"tokens_out"`
+	// TokensCached 是命中上游前缀缓存的输入 token 数（prompt_tokens 的子集）。
+	//
+	// 上游按请求随机路由到多个推理后端，各家的前缀缓存互相独立，
+	// 所以这个数直接反映「这次是不是落到了还热着的后端」。
+	TokensCached int     `json:"tokens_cached,omitempty"`
+	Cost         float64 `json:"cost"`
+	Err          string  `json:"err,omitempty"`
 }
 
 // Stats 是累计统计。
 type Stats struct {
-	TotalRequests  int64   `json:"total_requests"`
-	FailedRequests int64   `json:"failed_requests"`
-	TotalCharsOut  int64   `json:"total_chars_out"`
-	TotalTokensIn  int64   `json:"total_tokens_in"`
-	TotalTokensOut int64   `json:"total_tokens_out"`
-	TotalCost      float64 `json:"total_cost"`
+	TotalRequests  int64 `json:"total_requests"`
+	FailedRequests int64 `json:"failed_requests"`
+	TotalCharsOut  int64 `json:"total_chars_out"`
+	TotalTokensIn  int64 `json:"total_tokens_in"`
+	TotalTokensOut int64 `json:"total_tokens_out"`
+	// TotalTokensCached 是累计命中的缓存输入 token，用于算整池缓存命中率。
+	TotalTokensCached int64   `json:"total_tokens_cached"`
+	TotalCost         float64 `json:"total_cost"`
 	// StartedAt 是统计开始时间（首次启动），ResetAt 是最近一次手动重置的时间。
 	//
 	// 两者分开：控制台需要能解释「统计数比日志少」——重置只清计数，

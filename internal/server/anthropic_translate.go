@@ -403,10 +403,7 @@ func chatToAnthropicMessage(out map[string]any, publicModel string) map[string]a
 		"content":       content,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  usage.PromptTokens,
-			"output_tokens": usage.CompletionTokens,
-		},
+		"usage":         usage.anthropicUsage(usage.CompletionTokens),
 	}
 }
 

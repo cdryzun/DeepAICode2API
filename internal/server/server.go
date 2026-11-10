@@ -33,6 +33,13 @@ type Server struct {
 	inflightMu sync.Mutex
 	inflight   map[string]int
 
+	// pins 是「会话 → 账号」亲和表：同一会话的上文固定落在同一个号上。
+	//
+	// 上游的前缀缓存按账号（及其背后的推理后端）存放，每次请求重新轮询会把
+	// 同一条对话的缓存摊薄到 N 个号上，命中率大致除以 N。
+	pinMu sync.Mutex
+	pins  map[string]pinEntry
+
 	// quotaReprobeDelays 是入池后 0 额度的复探退避序列（测试可注入短值）。
 	quotaReprobeDelays []time.Duration
 
@@ -72,6 +79,7 @@ func New(st *store.Store) *Server {
 		Store: st, Up: deepai.NewClient(), Login: newLoginSessions(),
 		Registers: newRegisterJobs(), proxyClients: map[string]*deepai.Client{},
 		inflight:           map[string]int{},
+		pins:               map[string]pinEntry{},
 		probing:            map[string]struct{}{},
 		probeSem:           make(chan struct{}, probeWorkers),
 		quotaReprobeDelays: quotaReprobeDelays,

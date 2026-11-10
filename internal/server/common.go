@@ -27,6 +27,14 @@ type Usage struct {
 	CompletionTokens int
 	TotalTokens      int
 	ReasoningTokens  int
+	// CachedTokens 是命中上游前缀缓存的输入 token（属于 PromptTokens 的子集）。
+	//
+	// 这条信息以前在网关里被丢掉：只有 chat 路径因为「上游 JSON 原样透传」
+	// 碰巧正确，responses 被写死成 0、anthropic 根本没有字段。于是调用方
+	// 看到的缓存命中率恒为 0，反过来误以为是网关把缓存打散了。
+	CachedTokens int
+	// CacheWriteTokens 是本次写入上游缓存的输入 token（按写入价计费的量）。
+	CacheWriteTokens int
 	Cost             float64
 }
 
@@ -36,7 +44,33 @@ func (u *Usage) Add(v Usage) {
 	u.CompletionTokens += v.CompletionTokens
 	u.TotalTokens += v.TotalTokens
 	u.ReasoningTokens += v.ReasoningTokens
+	u.CachedTokens += v.CachedTokens
+	u.CacheWriteTokens += v.CacheWriteTokens
 	u.Cost += v.Cost
+}
+
+// cacheReadDetails 返回 OpenAI 口径的输入明细：cached_tokens 是 input_tokens 的子集。
+func (u Usage) cacheReadDetails() map[string]any {
+	return map[string]any{"cached_tokens": u.CachedTokens}
+}
+
+// anthropicUsage 按 Anthropic 口径组装用量。
+//
+// Anthropic 的 input_tokens **不含**缓存读写：客户端把
+// input + cache_read + cache_creation 当上下文总量。直接把上游的
+// prompt_tokens（含缓存）填进 input_tokens 会让 Claude Code 这类客户端
+// 把同一批 token 数两遍，上下文预算与费用估算都会翻倍。
+func (u Usage) anthropicUsage(outputTokens int) map[string]any {
+	input := u.PromptTokens - u.CachedTokens - u.CacheWriteTokens
+	if input < 0 {
+		input = 0
+	}
+	return map[string]any{
+		"input_tokens":                input,
+		"output_tokens":               outputTokens,
+		"cache_read_input_tokens":     u.CachedTokens,
+		"cache_creation_input_tokens": u.CacheWriteTokens,
+	}
 }
 
 // affinityPattern 与桌面端一致：只透传安全字符集的会话标识。
@@ -134,6 +168,82 @@ const (
 	admissionPoll = 50 * time.Millisecond
 )
 
+// 会话亲和（affinity → 账号）的参数。
+const (
+	// pinTTL 是一条会话保持在同一账号上的时长。
+	//
+	// 比上游的前缀缓存寿命长：上游缓存按分钟级 TTL 滑窗，只要会话还在
+	// 滚动，落回原账号就能继续命中；太长又会把新会话锁在旧号上。
+	pinTTL = 30 * time.Minute
+	// pinMax 是亲和表上限：不设上限时长时间运行会被短命会话撑大内存。
+	pinMax = 4096
+)
+
+// pinEntry 是一条会话绑定的账号及其过期时间。
+type pinEntry struct {
+	acctID string
+	exp    time.Time
+}
+
+// pinnedAccount 返回该会话当前绑定的账号 ID；过期/未绑定返回空串。
+func (s *Server) pinnedAccount(affinity string) string {
+	if affinity == "" {
+		return ""
+	}
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	e, ok := s.pins[affinity]
+	if !ok {
+		return ""
+	}
+	if time.Now().After(e.exp) {
+		delete(s.pins, affinity)
+		return ""
+	}
+	return e.acctID
+}
+
+// pinAccount 把会话绑到刚应答的账号上（affinity 为空时什么也不做）。
+func (s *Server) pinAccount(affinity, acctID string) {
+	if affinity == "" || acctID == "" {
+		return
+	}
+	now := time.Now()
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	if len(s.pins) >= pinMax {
+		// 先清过期项；仍满就整表清空。亲和只是最优化提示，丢掉不影响正确性。
+		for k, v := range s.pins {
+			if now.After(v.exp) {
+				delete(s.pins, k)
+			}
+		}
+		if len(s.pins) >= pinMax {
+			s.pins = map[string]pinEntry{}
+		}
+	}
+	s.pins[affinity] = pinEntry{acctID: acctID, exp: now.Add(pinTTL)}
+}
+
+// unpinAccount 解除会话绑定：换号成功前必须先松绑，否则下一次请求
+// 会被又钉回那个刚出错的号。
+func (s *Server) unpinAccount(affinity string) {
+	if affinity == "" {
+		return
+	}
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	delete(s.pins, affinity)
+}
+
+// dispatchable 判断账号是否属于可调度集合（与 pool.Scheduler 的准入一致）。
+func dispatchable(a *deepai.Account, group string) bool {
+	if a == nil || !a.Enabled || a.Status == deepai.StatusBlocked {
+		return false
+	}
+	return group == "" || strings.EqualFold(a.GroupName(), group)
+}
+
 // maxInFlightPerAccount 是单账号同时进行的上游请求上限。
 //
 // 调度只决定「这一轮选到谁」，不保证并发不会集中到少数账号；
@@ -166,7 +276,23 @@ func (b *releaseBody) Close() error {
 // 于是对外 429 而池里其实还有空槽（docs/performance.md §14）。
 // 返回值第三个标记池里是否有可选账号：区分「全忙」与「没有可调度账号」，
 // 后者要交给 noAccountError 给出可行动的原因（social_login / 未验证…）。
-func (s *Server) pickFreeAccount(group string) (*deepai.Account, bool, bool) {
+func (s *Server) pickFreeAccount(group, affinity string) (*deepai.Account, bool, bool) {
+	// 会话亲和优先：同一会话回到上一次应答的账号，缓存才不会被轮询摊薄。
+	//
+	// 只在「钉住的号还在、还能调度、还有空槽」时走这条路；号满了就退回
+	// 常规选择而不是排队——亲和是最优化，不该把请求拖慢。
+	if id := s.pinnedAccount(affinity); id != "" {
+		for _, a := range s.Store.Accounts() {
+			if a.ID != id {
+				continue
+			}
+			if dispatchable(a, group) && s.acquireAccount(a.ID) {
+				return a, true, true
+			}
+			break
+		}
+	}
+
 	candidates := false
 	for i, n := 0, len(s.Store.Accounts()); i < n; i++ {
 		a := s.Store.NextAccountGroup(group)
@@ -267,7 +393,7 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 	)
 	deadline := time.Now().Add(s.admissionWait)
 	for i := 0; i < maxTries; i++ {
-		acct, ok, candidates := s.pickFreeAccount(group)
+		acct, ok, candidates := s.pickFreeAccount(group, affinity)
 		if !candidates {
 			// 池里没有可调度账号（全被拦 / 分组为空）：交给 noAccountError 说明原因。
 			break
@@ -301,6 +427,7 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 		resp, err := client.OpenModel(ctx, acct, path, body, affinity)
 		if err != nil {
 			s.releaseAccount(acct.ID)
+			s.unpinAccount(affinity)
 			lastErr = err
 			s.Store.MarkAccountResult(acct.ID, false, err.Error())
 			if ctx.Err() != nil {
@@ -311,6 +438,8 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 
 		if resp.StatusCode/100 == 2 {
 			s.Store.MarkAccountResult(acct.ID, true, "")
+			// 应答成功才把会话钉到这个号：失败换号时钉回去只会重复踩坑。
+			s.pinAccount(affinity, acct.ID)
 			// 槽位随响应体一起释放：流式响应可能持续数分钟。
 			resp.Body = &releaseBody{ReadCloser: resp.Body, release: func() { s.releaseAccount(acct.ID) }}
 			return resp, acct, nil
@@ -324,6 +453,8 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 			s.Store.MarkAccountResult(acct.ID, false, readErr.Error())
 			continue
 		}
+		// 非 2xx：先松绑会话亲和，再决定「同号重试」还是「换号」。
+		s.unpinAccount(affinity)
 		httpErr := &deepai.HTTPError{Op: "上游推理", Status: resp.StatusCode, Body: payload}
 
 		// 上游 0.3.19 对请求体做了形状校验（400 + "This request is not one
@@ -334,6 +465,9 @@ func (s *Server) openModel(ctx context.Context, path string, body []byte, affini
 				if retry, err2 := client.OpenModel(ctx, acct, path, alt, affinity); err2 == nil {
 					if retry.StatusCode/100 == 2 {
 						s.Store.MarkAccountResult(acct.ID, true, "")
+						// 回退重试换了一套请求体（前缀变了），但号没变：
+						// 仍然把它当作这条会话的宿主，不必重新轮询。
+						s.pinAccount(affinity, acct.ID)
 						retry.Body = &releaseBody{ReadCloser: retry.Body, release: func() { s.releaseAccount(acct.ID) }}
 						return retry, acct, nil
 					}
@@ -571,6 +705,21 @@ func parseUsage(v any) Usage {
 	if c, ok := m["cost_details"].(map[string]any); ok && u.Cost == 0 {
 		u.Cost = floatOf(c["upstream_inference_cost"])
 	}
+	// 缓存用量：上游（OpenRouter 风格）把命中量放在 prompt_tokens_details，
+	// Responses 形状放在 input_tokens_details，Anthropic 形状是独立字段。
+	if d, ok := m["prompt_tokens_details"].(map[string]any); ok {
+		u.CachedTokens = intOf(d["cached_tokens"])
+		u.CacheWriteTokens = intOf(d["cache_write_tokens"])
+	}
+	if d, ok := m["input_tokens_details"].(map[string]any); ok && u.CachedTokens == 0 {
+		u.CachedTokens = intOf(d["cached_tokens"])
+	}
+	if u.CachedTokens == 0 {
+		u.CachedTokens = intOf(m["cache_read_input_tokens"])
+	}
+	if u.CacheWriteTokens == 0 {
+		u.CacheWriteTokens = intOf(m["cache_creation_input_tokens"])
+	}
 	return u
 }
 
@@ -628,18 +777,19 @@ func (s *Server) newReqLog(key string, acct *deepai.Account, model, endpoint str
 // done 落一条请求日志；err 为 nil 视为成功（HTTP 200），否则记为 502。
 func (l reqLog) done(outLen int, usage Usage, err error) {
 	e := store.LogEntry{
-		Time:      time.Now().Unix(),
-		Key:       mask(l.key),
-		Model:     l.model,
-		Endpoint:  l.endpoint,
-		Stream:    l.stream,
-		Status:    statusOf(err),
-		LatencyMS: time.Since(l.start).Milliseconds(),
-		PromptLen: l.inLen,
-		OutputLen: outLen,
-		TokensIn:  usage.PromptTokens,
-		TokensOut: usage.CompletionTokens,
-		Cost:      usage.Cost,
+		Time:         time.Now().Unix(),
+		Key:          mask(l.key),
+		Model:        l.model,
+		Endpoint:     l.endpoint,
+		Stream:       l.stream,
+		Status:       statusOf(err),
+		LatencyMS:    time.Since(l.start).Milliseconds(),
+		PromptLen:    l.inLen,
+		OutputLen:    outLen,
+		TokensIn:     usage.PromptTokens,
+		TokensOut:    usage.CompletionTokens,
+		TokensCached: usage.CachedTokens,
+		Cost:         usage.Cost,
 	}
 	if l.acct != nil {
 		e.Account = l.acct.ID

@@ -142,7 +142,10 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 		"message": map[string]any{
 			"id": msgID, "type": "message", "role": "assistant", "model": rl.model,
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+			// 流式开始前还不知道真实用量（它在尾帧），但缓存字段必须存在：
+			// Claude Code 这类客户端会在首帧就把 cache_read 记入上下文预算，
+			// 缺字段时它会把整段 prompt 当成未命中、重复计数。
+			"usage": Usage{}.anthropicUsage(0),
 		},
 	})
 
@@ -190,10 +193,7 @@ func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, payload
 	send("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": map[string]any{
-			"input_tokens":  usage.PromptTokens,
-			"output_tokens": outputTokens,
-		},
+		"usage": usage.anthropicUsage(outputTokens),
 	})
 	send("message_stop", map[string]any{"type": "message_stop"})
 
