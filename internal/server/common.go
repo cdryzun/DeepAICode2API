@@ -232,12 +232,23 @@ func (s *Server) unknownModelMessage(name string) string {
 	return msg
 }
 
+// DefaultMaxInflight / DefaultAdmissionWait 是槽位与排队的默认值。
+//
+// 号池总槽位 = 账号数 × DefaultMaxInflight。默认 2 来自 14 号池的压测结论
+// （docs/performance.md §14：并发 ≤20 时 100% 成功）。但号池缩到 1~2 个号时，
+// 同一个默认值会把「agent 一次扇出的几个子请求」直接压成 429，因此两个值都
+// 开放为可配置：-max-inflight / -admission-wait 及对应环境变量。
+const (
+	DefaultMaxInflight   = 2
+	DefaultAdmissionWait = 2 * time.Second
+)
+
 // admissionWait / admissionPoll 是「池里暂时没有空槽」时的排队上限与轮询间隔。
 //
 // 以前槽位不够就立刻 429（见 docs/performance.md §14：14 号 / 28 并发时
 // 成功率只有 48~70%）。短暂排队能把突发流量摊平，又不至于把调用方挂死。
 const (
-	admissionWait = 2 * time.Second
+	admissionWait = DefaultAdmissionWait
 	admissionPoll = 50 * time.Millisecond
 )
 
@@ -317,11 +328,9 @@ func dispatchable(a *deepai.Account, group string) bool {
 	return group == "" || strings.EqualFold(a.GroupName(), group)
 }
 
-// maxInFlightPerAccount 是单账号同时进行的上游请求上限。
-//
+// 单账号在途上限见 DefaultMaxInflight 与 Server.inflightCap()：
 // 调度只决定「这一轮选到谁」，不保证并发不会集中到少数账号；
 // 实测 12 并发时可能全落在 1~2 个号上，一碰上上游限流就是长尾。
-const maxInFlightPerAccount = 2
 
 // nonStreamBudget 是非流式请求的整体预算（选号 + 重试 + 读体）。
 //
@@ -387,7 +396,7 @@ func (s *Server) acquireAccount(id string) bool {
 	if s.inflight == nil {
 		s.inflight = map[string]int{}
 	}
-	if s.inflight[id] >= maxInFlightPerAccount {
+	if s.inflight[id] >= s.inflightCap() {
 		return false
 	}
 	s.inflight[id]++
@@ -418,7 +427,7 @@ func (s *Server) hasFreeAccount() bool {
 			continue
 		}
 		s.inflightMu.Lock()
-		busy := s.inflight[a.ID] >= maxInFlightPerAccount
+		busy := s.inflight[a.ID] >= s.inflightCap()
 		s.inflightMu.Unlock()
 		if !busy {
 			return true

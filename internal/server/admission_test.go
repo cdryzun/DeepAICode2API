@@ -3,6 +3,7 @@ package server
 import (
 	"io"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,5 +58,50 @@ func TestAllBusyRejectsAfterAdmissionWait(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("排队必须有上限，实际 %v", elapsed)
+	}
+}
+
+// TestSetAdmissionRaisesCapacity 校验槽位上限可配：默认 2 之外，
+// 号池缩小时可以抬高单号并发，避免「一次 agent 扇出」直接撞成 429。
+func TestSetAdmissionRaisesCapacity(t *testing.T) {
+	u := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c","object":"chat.completion","model":"glm-5.3-flash",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	})
+	s, key := newTestServer(t, u)
+	if got := s.inflightCap(); got != DefaultMaxInflight {
+		t.Fatalf("默认上限 = %d，期望 %d", got, DefaultMaxInflight)
+	}
+	s.SetAdmission(6, 15*time.Second)
+	if got := s.inflightCap(); got != 6 {
+		t.Fatalf("设置后上限 = %d，期望 6", got)
+	}
+
+	// 6 个并发在单账号上必须全部 200（默认值 2 的情况下会有 4 个 429）。
+	var wg sync.WaitGroup
+	codes := make([]int, 6)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := do(t, s, http.MethodPost, "/v1/chat/completions", key,
+				`{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}`)
+			codes[i] = rec.Code
+		}(i)
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("第 %d 个并发请求 status = %d，期望 200", i, c)
+		}
+	}
+
+	// 上限归零时回落到默认值，不能变成「0 槽位」。
+	s.SetAdmission(0, 0)
+	if got := s.inflightCap(); got != DefaultMaxInflight {
+		t.Fatalf("归零后上限 = %d，期望回落 %d", got, DefaultMaxInflight)
 	}
 }

@@ -36,17 +36,19 @@ func main() {
 	envfile.Load()
 
 	var (
-		host       = flag.String("host", envOr("DEEPAI2API_HOST", "127.0.0.1"), "监听地址")
-		port       = flag.Int("port", envInt("DEEPAI2API_PORT", 10087), "监听端口")
-		dataPath   = flag.String("data", envOr("DEEPAI2API_DATA_PATH", ""), "状态文件路径（默认在可执行文件同目录）")
-		deepaiDir  = flag.String("deepai-dir", envOr("DEEPAI2API_DATA_DIR", ""), "DeepAI Code 数据目录（留空自动探测）")
-		importOnly = flag.Bool("import", false, "仅执行一次桌面端凭据导入后退出")
-		noImport   = flag.Bool("no-import", false, "启动时不自动导入桌面端凭据")
-		adminPw    = flag.String("admin-password", envOr("DEEPAI2API_ADMIN_PASSWORD", ""), "管理密码（非空时覆盖状态文件中的设置）")
-		allowOpen  = flag.Bool("allow-insecure", envBool("DEEPAI2API_ALLOW_INSECURE", false), "允许非回环监听但不设管理密码（不安全）")
-		seal       = flag.Bool("seal", false, "把状态/统计/日志中的存量明文封存为密文后退出（需 "+store.EnvMasterKey+"）")
-		sealYes    = flag.Bool("yes", false, "配合 -seal：确认执行不可逆的封存")
-		showVer    = flag.Bool("version", false, "打印版本后退出")
+		host          = flag.String("host", envOr("DEEPAI2API_HOST", "127.0.0.1"), "监听地址")
+		port          = flag.Int("port", envInt("DEEPAI2API_PORT", 10087), "监听端口")
+		dataPath      = flag.String("data", envOr("DEEPAI2API_DATA_PATH", ""), "状态文件路径（默认在可执行文件同目录）")
+		deepaiDir     = flag.String("deepai-dir", envOr("DEEPAI2API_DATA_DIR", ""), "DeepAI Code 数据目录（留空自动探测）")
+		importOnly    = flag.Bool("import", false, "仅执行一次桌面端凭据导入后退出")
+		noImport      = flag.Bool("no-import", false, "启动时不自动导入桌面端凭据")
+		adminPw       = flag.String("admin-password", envOr("DEEPAI2API_ADMIN_PASSWORD", ""), "管理密码（非空时覆盖状态文件中的设置）")
+		allowOpen     = flag.Bool("allow-insecure", envBool("DEEPAI2API_ALLOW_INSECURE", false), "允许非回环监听但不设管理密码（不安全）")
+		maxInflight   = flag.Int("max-inflight", envInt("DEEPAI2API_MAX_INFLIGHT", server.DefaultMaxInflight), "单账号同时在途的上游请求上限（号池总槽位 = 账号数 × 该值）")
+		admissionWait = flag.Duration("admission-wait", envDuration("DEEPAI2API_ADMISSION_WAIT", server.DefaultAdmissionWait), "槽位全满时的排队上限，超时才回 429（0 表示立即拒绝）")
+		seal          = flag.Bool("seal", false, "把状态/统计/日志中的存量明文封存为密文后退出（需 "+store.EnvMasterKey+"）")
+		sealYes       = flag.Bool("yes", false, "配合 -seal：确认执行不可逆的封存")
+		showVer       = flag.Bool("version", false, "打印版本后退出")
 	)
 	flag.Parse()
 
@@ -136,6 +138,7 @@ func main() {
 	}
 
 	srv := server.New(st)
+	srv.SetAdmission(*maxInflight, *admissionWait)
 
 	addr := net.JoinHostPort(*host, fmt.Sprintf("%d", *port))
 	httpSrv := &http.Server{
@@ -391,6 +394,16 @@ func envInt(key string, def int) int {
 		var n int
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// envDuration 读取时长型环境变量（time.ParseDuration 语法，如 15s / 2m）。
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
 	return def

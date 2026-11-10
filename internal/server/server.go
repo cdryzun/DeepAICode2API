@@ -51,6 +51,9 @@ type Server struct {
 	// admissionWait 是「槽位全满」时的排队上限（测试可注入 0 立即 429）。
 	admissionWait time.Duration
 
+	// maxInflight 是单账号同时在途的上游请求上限（0 表示用默认值）。
+	maxInflight int
+
 	// quotaWG 跟踪已排期的异步配额复探。
 	//
 	// 复探 goroutine 在写完内存后还要 Save() 落盘；测试必须等它完全收尾
@@ -84,12 +87,38 @@ func New(st *store.Store) *Server {
 		probeSem:           make(chan struct{}, probeWorkers),
 		quotaReprobeDelays: quotaReprobeDelays,
 		admissionWait:      admissionWait,
+		maxInflight:        DefaultMaxInflight,
 	}
 	// 上次探测到的车道优先（跨重启保留），否则用编译期默认值。
 	if lane := strings.TrimSpace(st.Settings().Lane); lane != "" {
 		s.Up.SetLane(lane)
 	}
 	return s
+}
+
+// SetAdmission 覆盖并发槽位与排队上限（<=0 表示沿用默认）。
+//
+// 号池总槽位 = 账号数 × maxInflight。号池缩小时必须相应抬高单号并发，
+// 否则一次 agent 扇出就会撞上「所有账号并发已满」。
+func (s *Server) SetAdmission(maxInflight int, wait time.Duration) {
+	// <=0 视为「回到默认」，而不是「保留上一次的值」：调用方传 0 时
+	// 期待的是一份干净的默认配置，不是上一个配置的残留。
+	if maxInflight > 0 {
+		s.maxInflight = maxInflight
+	} else {
+		s.maxInflight = DefaultMaxInflight
+	}
+	if wait >= 0 {
+		s.admissionWait = wait
+	}
+}
+
+// inflightCap 返回当前生效的单账号在途上限。
+func (s *Server) inflightCap() int {
+	if s.maxInflight > 0 {
+		return s.maxInflight
+	}
+	return DefaultMaxInflight
 }
 
 // Handler 返回完整路由。

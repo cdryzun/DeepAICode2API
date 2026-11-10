@@ -1170,3 +1170,35 @@ turn6 prompt=1009 cached=960  hit=95.1%  provider=Wafer
 忽略，单请求内无法指定推理后端；实测 6 次请求落在 Modal / Wafer / CoreWeave /
 InferenceNet 四家。命中率因此仍受上游路由随机性影响，网关只能保证「同一会话
 不自己把缓存摊薄」与「用量如实上报」。
+
+---
+
+## 29. 槽位与排队：从编译期常量到可配
+
+**现象**：线上号池缩到 2 个号时，最近 200 条请求里 152 条是
+`429 all accounts busy`；现场 5 并发探测 5/5 拒绝，10 并发探测 10/10 拒绝。
+
+**根因**：号池总槽位 = `账号数 × maxInFlightPerAccount`，后者是编译期常量 2。
+14 号池时 28 槽位够用（§14 压测：并发 ≤20 时 100% 成功），但号池只有 1~2 个
+可用号时，同一个常量把总容量压到 2~4，agent 一次扇出就打满；再加
+`admissionWait=2s` 的短排队，突发流量直接变成拒绝。同一时刻直连上游做 6 并发
+对照：**6/6 HTTP 200**，说明当时卡住的是网关自己的背压，不是上游 `409 session_busy`。
+
+**改动**：
+
+- `server.DefaultMaxInflight` / `server.DefaultAdmissionWait` 导出，`Server` 增加
+  `maxInflight` 字段与 `SetAdmission()`；`-max-inflight` / `-admission-wait`
+  及 `DEEPAI2API_MAX_INFLIGHT` / `DEEPAI2API_ADMISSION_WAIT` 可覆盖，默认值不变；
+- `0` 表示「回到默认」而不是「保留上一次的值」；`admission-wait=0` 仍是立即 429；
+- 测试：`TestSetAdmissionRaisesCapacity`（单号 6 并发全部 200、归零回落默认）。
+
+**验证**：`cap=6, wait=15s` 上线后，10 并发直接打网关 10/10 200，经 magpie
+网关 8 并发 8/8 200（改前 5 并发即全灭）。
+
+**边界**：抬并发只是把背压从网关挪回上游。上游对单账号有**按天请求数**上限
+（`Too many requests today. Try again tomorrow.`，与 Theos 余额无关），所以号池
+数量仍然是硬约束——`docs/performance.md` §14 的结论「每号 +2 槽位比继续抬常量稳」
+在号池足够时依然成立。
+
+**遗留**：日志里 `statusOf(err)` 把所有网关侧错误记成 502，但客户端收到的是
+`errAllAccountsBusy` 的 429。统计口径要靠 `err` 文本区分，本轮没动。

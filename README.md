@@ -292,6 +292,8 @@ print(client.chat.completions.create(
 | `-deepai-dir` | `DEEPAI2API_DATA_DIR` | 自动探测 | 桌面端数据目录 |
 | `-admin-password` | `DEEPAI2API_ADMIN_PASSWORD` | 空 | 管理密码 |
 | `-allow-insecure` | `DEEPAI2API_ALLOW_INSECURE` | `false` | 允许非回环监听但不设管理密码 |
+| `-max-inflight` | `DEEPAI2API_MAX_INFLIGHT` | `2` | 单号同时在途的上游请求上限（总槽位 = 账号数 × 该值） |
+| `-admission-wait` | `DEEPAI2API_ADMISSION_WAIT` | `2s` | 槽位全满时的排队上限，超时才回 429（`0` 立即拒绝） |
 | `-import` | — | — | 仅导入凭据后退出 |
 | `-no-import` | — | — | 启动时不自动导入 |
 | `-seal` | — | — | 把状态/统计/日志中的存量明文封存为密文后退出（需 `DEEPAI2API_MASTER_KEY`） |
